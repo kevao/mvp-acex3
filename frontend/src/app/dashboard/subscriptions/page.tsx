@@ -1,0 +1,314 @@
+"use client";
+
+import { useState, useEffect } from "react";
+import type { AxiosError } from "axios";
+import PlanSelector from "@/components/PlanSelector";
+import { api, Subscription, Invoice } from "@/services/api";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { toast } from "sonner";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+
+const SubscriptionPage = () => {
+  const [subscription, setSubscription] = useState<Subscription | null>(null);
+  const [invoices, setInvoices] = useState<Invoice[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [isCancelDialogOpen, setIsCancelDialogOpen] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
+  const [isErrorDialogOpen, setIsErrorDialogOpen] = useState(false);
+
+  const parseApiError = (error: unknown) => {
+    const axiosError = error as AxiosError<{ message?: string }>;
+    const status = axiosError.response?.status;
+    const apiMessage = axiosError.response?.data?.message;
+    const fallbackMessage = axiosError.message;
+    return { status, apiMessage, fallbackMessage, raw: axiosError };
+  };
+
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        setLoading(true);
+        setFetchError(null);
+        const [subscriptionData, invoicesData] = await Promise.all([
+          api.getCurrentSubscription(),
+          api.getInvoices(),
+        ]);
+        setSubscription(subscriptionData);
+        setInvoices(Array.isArray(invoicesData) ? invoicesData : []);
+      } catch (error: unknown) {
+        const { status, apiMessage, fallbackMessage, raw } = parseApiError(error);
+        // Se não houver assinatura (404), tratamos como sem plano, sem alerta/toast.
+        if (status === 404) {
+          setSubscription(null);
+          setInvoices([]);
+          setFetchError(null);
+        } else {
+          const msg = apiMessage || (status === 401 ? "Faça login para ver sua assinatura." : (fallbackMessage || "Falha ao buscar dados"));
+          console.error("Erro ao buscar dados:", raw?.response?.data || raw);
+          toast.error(msg);
+          setFetchError(msg);
+          setInvoices([]); // Garante que seja array vazio em caso de erro
+        }
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchData();
+  }, []);
+
+  const handleCancelSubscription = async () => {
+    try {
+      console.log('Iniciando cancelamento de assinatura...');
+      setIsCancelling(true);
+      await api.cancelSubscription();
+      setIsCancelDialogOpen(false);
+      // Aguarda 3s para dar tempo do webhook processar, depois recarrega
+      setTimeout(() => window.location.reload(), 3000);
+    } catch (error: unknown) {
+      const { fallbackMessage, raw } = parseApiError(error);
+      console.error('Erro ao cancelar assinatura:', raw);
+      console.log('Erro ao cancelar assinatura:', fallbackMessage || error);
+      setIsErrorDialogOpen(true);
+    } finally {
+      setIsCancelling(false);
+    }
+  };
+
+  const formatDate = (dateString?: string) => {
+    if (!dateString) return "N/A";
+
+    // Remove timestamp se existir, pega apenas YYYY-MM-DD
+    const dateOnly = dateString.split('T')[0];
+
+    // Parse manual para evitar timezone (formato: YYYY-MM-DD)
+    const [year, month, day] = dateOnly.split('-');
+
+    if (!year || !month || !day) {
+      return "Data inválida";
+    }
+
+    // Retorna no formato dd/MM/yyyy sem usar Date
+    return `${day}/${month}/${year}`;
+  }; const formatPrice = (cents: number) => {
+    return `R$ ${(cents / 100).toFixed(2).replace(".", ",")}`;
+  };
+
+  const getStatusLabel = (status: string) => {
+    const labels: Record<string, string> = {
+      active: "Ativo",
+      expiring: "Cancelado",
+      canceled: "Cancelado",
+      past_due: "Vencido",
+      unpaid: "Não pago",
+    };
+    return labels[status] || status;
+  };
+
+  if (loading) {
+    return <div className="text-center py-8">Carregando assinatura...</div>;
+  }
+
+  return (
+    <div className="space-y-8">
+      <div>
+        <h1 className="text-3xl font-bold">Gerenciamento de Assinatura</h1>
+        <p className="text-muted-foreground">Visualize e gerencie seu plano e faturamento.</p>
+      </div>
+
+      {fetchError && (
+        <Alert variant="destructive">
+          <AlertTitle>Não foi possível carregar</AlertTitle>
+          <AlertDescription>{fetchError}</AlertDescription>
+        </Alert>
+      )}
+
+      {subscription && subscription.plan ? (
+        <Card>
+          <CardHeader>
+            <CardDescription>Seu Plano Atual</CardDescription>
+            <CardTitle>{subscription.plan.name}</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex gap-4 items-center">
+              <p>Status</p>
+              <Badge variant={subscription.status === "active" ? "default" : "destructive"}>
+                {getStatusLabel(subscription.status)}
+              </Badge>
+            </div>
+            {subscription.status === 'expiring' ? (
+              <div className="text-sm text-muted-foreground">
+                {subscription.periodEnd ? (
+                  <p>Seu plano seguirá ativo até {formatDate(subscription.periodEnd)}. Você não receberá cobranças novamente.</p>
+                ) : (
+                  <p>Plano será cancelado em breve.</p>
+                )}
+              </div>
+            ) : (
+              subscription.periodEnd && (
+                <div className="flex gap-4 items-center">
+                  <p>Próxima cobrança em {formatDate(subscription.periodEnd)}</p>
+                  <p className="font-semibold">{formatPrice(subscription.plan.priceCents)}</p>
+                </div>
+              )
+            )}
+          </CardContent>
+          <CardFooter>
+            {subscription.status === "active" && subscription.plan.priceCents > 0 && (
+              <Button
+                variant="outline"
+                onClick={() => setIsCancelDialogOpen(true)}
+                className="hover:bg-red-900 hover:text-white hover:border-red-900 transition-colors"
+              >
+                {isCancelling ? 'Cancelando...' : 'Cancelar Assinatura'}
+              </Button>
+            )}
+          </CardFooter>
+        </Card>
+      ) : (
+        <Card>
+          <CardHeader>
+            <CardTitle>Você não tem um plano ativo no momento.</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-sm text-muted-foreground">Contrate um dos planos abaixo para liberar todos os benefícios.</p>
+          </CardContent>
+        </Card>
+      )}
+
+      <Dialog open={isCancelDialogOpen} onOpenChange={setIsCancelDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Cancelar Assinatura</DialogTitle>
+            <DialogDescription>
+              Tem certeza que deseja cancelar sua assinatura? Você perderá acesso aos benefícios premium.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-0">
+            <Button
+              variant="outline"
+              onClick={() => setIsCancelDialogOpen(false)}
+              className="border-2 px-16 transition duration-150 hover:bg-green-600/10 hover:border-green-600/10"
+            >
+              Não
+            </Button>
+            <Button
+              onClick={handleCancelSubscription}
+              className="bg-red-600 hover:bg-red-700 px-8"
+            >
+              Sim
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={isErrorDialogOpen} onOpenChange={setIsErrorDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Erro</DialogTitle>
+            <DialogDescription>
+              Não foi possível cancelar sua assinatura no momento. Tente novamente mais tarde.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              onClick={() => setIsErrorDialogOpen(false)}
+              className="bg-blue-600 hover:bg-blue-700 px-8"
+            >
+              Entendi
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <div>
+        <h2 className="text-2xl font-bold">{subscription?.plan ? "Mudar de Plano" : "Selecionar Plano"}</h2>
+        <p className="text-muted-foreground">
+          {subscription?.plan
+            ? "Escolha um novo plano, se desejar alterar sua assinatura."
+            : "Selecione um plano para ativar sua assinatura."}
+        </p>
+      </div>
+      <PlanSelector
+        currentPlanId={subscription?.plan?.id}
+      />
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Histórico de Faturamento</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {invoices.length === 0 ? (
+            <p className="text-muted-foreground text-center py-4">Nenhuma fatura encontrada</p>
+          ) : (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b">
+                  <th className="text-left py-2">Criação</th>
+                  <th className="text-center py-2">Validade</th>
+                  <th className="text-center py-2">Status</th>
+                  <th className="text-center py-2">Valor</th>
+                  <th className="text-right py-2">Ações</th>
+                </tr>
+              </thead>
+              <tbody>
+                {invoices.map((invoice) => (
+                  <tr key={invoice.id} className="border-b">
+                    <td className="text-left py-2">{formatDate(invoice.createdAt)}</td>
+                    <td className="text-center py-2">{formatDate(invoice.dueDate)}</td>
+                    <td className="text-center py-2">
+                      <Badge
+                        variant={
+                          invoice.status === 'CONFIRMED' ? 'default' :
+                            invoice.status === 'OVERDUE' ? 'destructive' :
+                              invoice.status === 'PENDING' ? 'secondary' :
+                                'outline'
+                        }
+                        className={
+                          invoice.status === 'CONFIRMED' ? 'bg-green-600 hover:bg-green-700' :
+                            invoice.status === 'PENDING' ? 'bg-cyan-600 hover:bg-cyan-700 text-white' :
+                              invoice.status === 'OVERDUE' ? 'bg-red-600 hover:bg-red-700' :
+                                invoice.status === 'REFUNDED' ? 'bg-purple-600 hover:bg-purple-700 text-white' :
+                                  'bg-gray-400 hover:bg-gray-500 text-white'
+                        }
+                      >
+                        {invoice.status === 'CONFIRMED' ? 'Pago' :
+                          invoice.status === 'PENDING' ? 'Aberta' :
+                            invoice.status === 'OVERDUE' ? 'Atrasada' :
+                              invoice.status === 'REFUNDED' ? 'Reembolsada' :
+                                'Cancelada'}
+                      </Badge>
+                    </td>
+                    <td className="text-center py-2">R$ {parseFloat(invoice.amount).toFixed(2).replace('.', ',')}</td>
+                    <td className="text-right py-2">
+                      {invoice.invoiceUrl ? (
+                        <a href={invoice.invoiceUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                          Ver Fatura
+                        </a>
+                      ) : (
+                        <span className="text-muted-foreground">-</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+};
+
+export default SubscriptionPage;

@@ -1,0 +1,407 @@
+import { Injectable, NotFoundException, ConflictException, Inject, Logger } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository, MoreThanOrEqual } from 'typeorm';
+import { Subscription } from './entities/subscription.entity';
+import { Plan } from './entities/plan.entity';
+import { IPaymentGateway } from './interfaces/payment-gateway.interface';
+import { GatewayMetaService } from './services/gateway-meta.service';
+import { InvoiceService } from './services/invoice.service';
+
+@Injectable()
+export class SubscriptionsService {
+  constructor(
+    @InjectRepository(Subscription)
+    private readonly subscriptionRepository: Repository<Subscription>,
+    @InjectRepository(Plan)
+    private readonly planRepository: Repository<Plan>,
+    @Inject('ASAAS_GATEWAY')
+    private readonly asaasGateway: IPaymentGateway,
+    private readonly gatewayMetaService: GatewayMetaService,
+    private readonly invoiceService: InvoiceService,
+  ) { }
+
+  private readonly logger = new Logger(SubscriptionsService.name);
+
+  async getCurrentSubscription(userId: string): Promise<Subscription | null> {
+    const now = new Date();
+
+    // Atualiza assinaturas que estão em 'expiring' mas cujo período já passou -> 'canceled'
+    await this.subscriptionRepository
+      .createQueryBuilder()
+      .update(Subscription)
+      .set({ status: 'canceled' })
+      .where("status = :expiring", { expiring: 'expiring' })
+      .andWhere('periodEnd IS NOT NULL')
+      .andWhere('periodEnd < :now', { now })
+      .execute();
+
+    // Busca assinatura ativa ou em expiring cujo período ainda não expirou
+    return this.subscriptionRepository
+      .createQueryBuilder('subscription')
+      .leftJoinAndSelect('subscription.plan', 'plan')
+      .where('subscription.userId = :userId', { userId })
+      .andWhere('subscription.status IN (:...statuses)', { statuses: ['active', 'expiring'] })
+      .andWhere('subscription.periodStart <= :now OR subscription.periodStart IS NULL', { now })
+      .andWhere('(subscription.periodEnd >= :now OR subscription.periodEnd IS NULL)', { now })
+      .orderBy('subscription.createdAt', 'DESC')
+      .getOne();
+  }
+
+  async getSubscriptionHistory(userId: string): Promise<Subscription[]> {
+    return this.subscriptionRepository
+      .createQueryBuilder('subscription')
+      .leftJoinAndSelect('subscription.plan', 'plan')
+      .where('subscription.userId = :userId', { userId })
+      .orderBy('subscription.createdAt', 'DESC')
+      .getMany();
+  }
+
+  async getAllPlans(): Promise<Plan[]> {
+    return this.planRepository.find({
+      where: { isActive: true },
+      order: { priceCents: 'ASC' },
+    });
+  }
+
+  async changePlan(userId: string, planId: string): Promise<Subscription> {
+    const plan = await this.planRepository.findOne({ where: { id: planId } });
+    if (!plan) {
+      throw new NotFoundException(`Plan with ID ${planId} not found`);
+    }
+
+    if (!plan.isActive) {
+      throw new ConflictException('Plan is not active');
+    }
+
+    // Cancelar assinatura atual se existir
+    const currentSubscription = await this.getCurrentSubscription(userId);
+    if (currentSubscription) {
+      currentSubscription.status = 'expiring';
+      await this.subscriptionRepository.save(currentSubscription);
+    }
+
+    // Criar nova assinatura
+    const now = new Date();
+    const periodEnd = new Date(now);
+
+    if (plan.billingPeriod === 'monthly') {
+      periodEnd.setMonth(periodEnd.getMonth() + 1);
+    } else if (plan.billingPeriod === 'yearly') {
+      periodEnd.setFullYear(periodEnd.getFullYear() + 1);
+    }
+
+    const newSubscription = this.subscriptionRepository.create({
+      userId,
+      planId,
+      status: 'active',
+      periodStart: now,
+      periodEnd: periodEnd,
+    });
+
+    return this.subscriptionRepository.save(newSubscription);
+  }
+
+  async checkSubscriptionAccess(userId: string): Promise<boolean> {
+    const subscription = await this.getCurrentSubscription(userId);
+
+    if (!subscription) {
+      return false;
+    }
+
+    // 'expiring' é considerado ativo até periodEnd
+    return (subscription.status === 'active' || subscription.status === 'expiring') &&
+      (!subscription.periodEnd || subscription.periodEnd > new Date());
+  }
+
+  async getSubscriptionLimits(userId: string): Promise<any> {
+    const subscription = await this.getCurrentSubscription(userId);
+
+    if (!subscription) {
+      return null;
+    }
+
+    const plan = subscription.plan;
+    const features = Array.isArray(plan.features) ? plan.features : [];
+
+    return {
+      planName: plan.name,
+      isPremium: plan.priceCents > 0,
+      features,
+      billingPeriod: plan.billingPeriod,
+      periodEnd: subscription.periodEnd,
+    };
+  }
+
+  // Planos com preço zero foram removidos do produto; criação não é suportada.
+
+  /**
+   * Cria um link de checkout para assinatura paga
+   */
+  async createCheckoutSession(
+    userId: string,
+    planId: string,
+    userEmail: string,
+    userName: string,
+    userCpf?: string,
+  ): Promise<{ checkoutUrl: string }> {
+    // Busca o plano
+    const plan = await this.planRepository.findOne({ where: { id: planId } });
+    if (!plan) {
+      throw new NotFoundException(`Plano ${planId} não encontrado`);
+    }
+
+    if (!plan.isActive) {
+      throw new ConflictException('Plano não está ativo');
+    }
+
+    if (plan.priceCents === 0) {
+      throw new ConflictException('Planos com preço zero não são suportados');
+    }
+
+    // Cria Checkout Link
+    const cycle = plan.billingPeriod === 'monthly' ? 'MONTHLY' : 'YEARLY';
+    const planValue = plan.priceCents / 100; // Converte centavos para reais
+
+    const { checkoutUrl, checkoutId } = await this.asaasGateway.createCheckoutLink(
+      userId,
+      planValue,
+      cycle,
+      plan.name,
+      plan.description || plan.name,
+    );
+
+    // Atualiza o meta para incluir o planId
+    await this.gatewayMetaService.updateMetas('asaas', 'user', userId, {
+      checkout: {
+        id: checkoutId,
+        link: checkoutUrl,
+        planId: planId,
+      },
+    });
+
+    return { checkoutUrl };
+  }
+
+
+
+  /**
+   * Cancela assinatura no gateway e localmente
+   */
+  async cancelSubscription(userId: string): Promise<void> {
+    const subscription = await this.getCurrentSubscription(userId);
+
+    if (!subscription) {
+      throw new NotFoundException('Nenhuma assinatura ativa encontrada');
+    }
+
+    // Se é assinatura paga do Asaas, cancela no gateway e DEIXA O WEBHOOK ATUALIZAR O STATUS LOCAL
+    if (subscription.provider === 'asaas' && subscription.providerSubscriptionId) {
+      if (this.asaasGateway.cancelSubscription) {
+        try {
+          await this.asaasGateway.cancelSubscription(subscription.providerSubscriptionId);
+          this.logger.log(`Chamada ao gateway para cancelar subscription ${subscription.providerSubscriptionId} executada com sucesso; aguardando webhook para atualizar status local.`);
+
+          // Cancela faturas pendentes locais relacionadas a essa subscription
+          try {
+            await this.invoiceService.cancelInvoicesForSubscription(subscription.id);
+            this.logger.log(`Invoices relacionadas à subscription ${subscription.id} marcadas como CANCELED`);
+          } catch (invErr) {
+            this.logger.error(`Erro ao cancelar invoices locais: ${invErr?.message || invErr}`);
+          }
+
+          // Não alteramos o status local aqui: o webhook (SUBSCRIPTION_DELETED) deve marcar a subscription como 'expiring'.
+          return;
+        } catch (error) {
+          this.logger.error(`Erro ao cancelar subscription no gateway: ${error?.message || error}`);
+          // Em caso de falha no gateway, marcamos localmente como 'canceled' (comportamento anterior)
+          subscription.status = 'canceled';
+          await this.subscriptionRepository.save(subscription);
+
+          // Cancela faturas locais também
+          try {
+            await this.invoiceService.cancelInvoicesForSubscription(subscription.id);
+            this.logger.log(`Invoices relacionadas à subscription ${subscription.id} marcadas como CANCELED`);
+          } catch (invErr) {
+            this.logger.error(`Erro ao cancelar invoices locais: ${invErr?.message || invErr}`);
+          }
+
+          this.logger.log(`Subscription local marcada como 'canceled' após falha no gateway (userId=${userId}, id=${subscription.id})`);
+          throw error;
+        }
+      }
+    }
+
+    // Assinaturas sem provider: cancela localmente imediatamente (comportamento original)
+    subscription.status = 'canceled';
+    await this.subscriptionRepository.save(subscription);
+    try {
+      await this.invoiceService.cancelInvoicesForSubscription(subscription.id);
+      this.logger.log(`Invoices relacionadas à subscription ${subscription.id} marcadas como CANCELED`);
+    } catch (invErr) {
+      this.logger.error(`Erro ao cancelar invoices locais: ${invErr?.message || invErr}`);
+    }
+  }
+
+  /**
+   * Processa pagamento recebido via webhook usando checkoutSession
+   */
+  async processPaymentReceived(checkoutSessionId: string, payment: any): Promise<Subscription> {
+    // Busca usuário pelo checkoutSession
+    const userMeta = await this.gatewayMetaService.findUserByCheckoutSession(
+      'asaas',
+      checkoutSessionId,
+    );
+
+    if (!userMeta) {
+      throw new NotFoundException(
+        `Usuário não encontrado para checkoutSession ${checkoutSessionId}`,
+      );
+    }
+
+    const userId = userMeta.entityId;
+    const planId = userMeta.metas?.checkout?.planId;
+
+    if (!planId) {
+      throw new ConflictException(
+        `PlanId não encontrado no checkout para usuário ${userId}`,
+      );
+    }
+
+    // Busca o plano
+    const plan = await this.planRepository.findOne({ where: { id: planId } });
+    if (!plan) {
+      throw new NotFoundException(`Plano ${planId} não encontrado`);
+    }
+
+    // Cancela assinatura atual se existir
+    const currentSubscription = await this.getCurrentSubscription(userId);
+    if (currentSubscription) {
+      currentSubscription.status = 'expiring';
+      if (!currentSubscription.periodEnd) {
+        // Define uma data de término razoável (por segurança, hoje)
+        currentSubscription.periodEnd = new Date();
+      }
+      await this.subscriptionRepository.save(currentSubscription);
+    }
+
+    // Calcula period_end baseado no ciclo do plano
+    const now = new Date();
+    const periodEnd = new Date(now);
+
+    if (plan.billingPeriod === 'monthly') {
+      periodEnd.setMonth(periodEnd.getMonth() + 1);
+    } else if (plan.billingPeriod === 'yearly') {
+      periodEnd.setFullYear(periodEnd.getFullYear() + 1);
+    }
+
+    // Cria nova assinatura
+    const newSubscription = this.subscriptionRepository.create({
+      userId,
+      planId,
+      status: 'active',
+      periodStart: now,
+      periodEnd,
+      provider: 'asaas',
+      providerSubscriptionId: payment.subscription || payment.id,
+    });
+
+    return this.subscriptionRepository.save(newSubscription);
+  }
+
+  /**
+   * Busca subscription por provider e providerId
+   */
+  async findByProviderId(
+    provider: string,
+    providerId: string,
+  ): Promise<Subscription | null> {
+    return this.subscriptionRepository.findOne({
+      where: {
+        provider,
+        providerSubscriptionId: providerId,
+      },
+    });
+  }
+
+  /**
+   * Ativa uma assinatura
+   */
+  async activateSubscription(subscriptionId: string): Promise<void> {
+    const subscription = await this.subscriptionRepository.findOne({
+      where: { id: subscriptionId },
+    });
+
+    if (!subscription) {
+      throw new NotFoundException(`Subscription ${subscriptionId} não encontrada`);
+    }
+
+    subscription.status = 'active';
+    await this.subscriptionRepository.save(subscription);
+  }
+
+  /**
+   * Marca uma subscription como 'expiring' (usado por webhooks de cancelamento)
+   */
+  async expireSubscription(subscriptionId: string): Promise<void> {
+    const subscription = await this.subscriptionRepository.findOne({ where: { id: subscriptionId } });
+    if (!subscription) {
+      throw new NotFoundException(`Subscription ${subscriptionId} não encontrada`);
+    }
+
+    subscription.status = 'expiring';
+    if (!subscription.periodEnd) {
+      subscription.periodEnd = new Date();
+    }
+    await this.subscriptionRepository.save(subscription);
+  }
+
+  /**
+   * Pausa uma assinatura
+   */
+  async pauseSubscription(subscriptionId: string): Promise<void> {
+    const subscription = await this.subscriptionRepository.findOne({
+      where: { id: subscriptionId },
+    });
+
+    if (!subscription) {
+      throw new NotFoundException(`Subscription ${subscriptionId} não encontrada`);
+    }
+
+    subscription.status = 'past_due';
+    await this.subscriptionRepository.save(subscription);
+  }
+
+  /**
+   * Verifica se a assinatura do usuário está válida
+   * (todas as faturas vencidas devem estar pagas)
+   */
+  async isSubscriptionValid(userId: string): Promise<boolean> {
+    const subscription = await this.getCurrentSubscription(userId);
+
+    if (!subscription) {
+      return false;
+    }
+
+    // Se está com status diferente de active/expiring, não é válida
+    if (subscription.status !== 'active' && subscription.status !== 'expiring') {
+      return false;
+    }
+
+    // Verifica se período ainda está válido
+    if (subscription.periodEnd && new Date() > subscription.periodEnd) {
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Busca pagamentos de uma subscription no gateway Asaas
+   */
+  async getAsaasSubscription(asaasSubscriptionId: string): Promise<any> {
+    if (this.asaasGateway.getSubscriptionPayments) {
+      return this.asaasGateway.getSubscriptionPayments(asaasSubscriptionId);
+    }
+    throw new Error('Gateway não suporta busca de pagamentos');
+  }
+}
